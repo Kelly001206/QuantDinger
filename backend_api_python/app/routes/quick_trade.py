@@ -1383,7 +1383,8 @@ def _fetch_exchange_positions_raw(
         else:
             inst_id = to_okx_swap_inst_id(symbol)
             inst_type = "SWAP"
-        return client.get_positions(inst_id=inst_id, inst_type=inst_type)
+        raw = client.get_positions(inst_id=inst_id, inst_type=inst_type)
+        return _normalize_okx_positions_raw(raw)
 
     if isinstance(client, BinanceFuturesClient):
         return client.get_positions(symbol=symbol)
@@ -1462,6 +1463,9 @@ def _fetch_exchange_positions_raw(
                 base_amt = client.contracts_signed_to_base_qty(contract=c, contracts_signed=ct_sz)
                 if base_amt > 0:
                     q["positionAmt"] = base_amt
+                    # Preserve direction for _parse_positions — Gate encodes short as
+                    # negative contract size but positionAmt is always positive.
+                    q["positionSide"] = "LONG" if ct_sz > 0 else "SHORT"
             out.append(q)
         logger.info("Gate filtered positions for %s: %d items, sizes=%s", c, len(out),
                      [(p.get("size"), p.get("positionAmt")) for p in out])
@@ -1572,6 +1576,113 @@ def get_position():
         return jsonify({"code": 0, "msg": str(e)}), 500
 
 
+def _normalize_okx_positions_raw(raw: Any) -> Any:
+    """
+    OKX net-mode rows use ``posSide=net`` with a *signed* ``pos`` (negative = short).
+    Attach ``positionSide`` so downstream parsers never default to long when posSide
+    is present but not literally ``long``/``short``.
+    """
+    if not isinstance(raw, dict):
+        return raw
+    data = raw.get("data")
+    if not isinstance(data, list):
+        return raw
+    out_rows = []
+    for item in data:
+        if not isinstance(item, dict):
+            out_rows.append(item)
+            continue
+        row = dict(item)
+        ps = str(row.get("posSide") or "").strip().lower()
+        if ps in ("long", "short"):
+            row.setdefault("positionSide", ps.upper())
+        elif ps == "net":
+            signed = None
+            for key in ("pos", "availPos", "posAmt"):
+                try:
+                    v = float(row.get(key) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if abs(v) > 1e-10:
+                    signed = v
+                    break
+            if signed is not None:
+                row["positionSide"] = "SHORT" if signed < 0 else "LONG"
+        out_rows.append(row)
+    out = dict(raw)
+    out["data"] = out_rows
+    return out
+
+
+def _extract_signed_position_qty(item: dict) -> float:
+    """Return signed position qty; OKX ``pos`` must be checked before abs-only fields."""
+    for key in (
+        "pos", "positionAmt", "posAmt", "size", "currentQty", "volume",
+        "contracts", "total", "current_qty", "availPos",
+    ):
+        try:
+            v = float(item.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(v) > 1e-10:
+            return v
+    return 0.0
+
+
+def _infer_position_side_from_row(item: dict) -> str:
+    """Map heterogeneous exchange position rows to ``long`` / ``short``."""
+    psu = str(item.get("positionSide") or item.get("position_side") or "").strip().upper()
+    if psu == "SHORT":
+        return "short"
+    if psu == "LONG":
+        return "long"
+
+    pos_side = str(item.get("posSide") or "").strip().lower()
+    if pos_side in ("long", "short"):
+        return pos_side
+
+    # OKX 买卖模式 (net_mode): posSide=net, sign lives on pos / availPos
+    if pos_side == "net":
+        signed = _extract_signed_position_qty(item)
+        if signed < -1e-10:
+            return "short"
+        if signed > 1e-10:
+            return "long"
+
+    hold = str(item.get("holdSide") or "").strip().lower()
+    if hold in ("long", "short"):
+        return hold
+
+    try:
+        idx = int(item.get("positionIdx") or 0)
+        if idx == 1:
+            return "long"
+        if idx == 2:
+            return "short"
+    except (TypeError, ValueError):
+        pass
+
+    exch_side = str(item.get("side") or "").strip().lower()
+    if exch_side in ("sell", "s", "short"):
+        return "short"
+    if exch_side in ("buy", "b", "long"):
+        return "long"
+
+    direction = str(item.get("direction") or "").strip().lower()
+    if direction in ("sell", "short", "open_short"):
+        return "short"
+    if direction in ("buy", "long", "open_long"):
+        return "long"
+
+    # Signed quantity fallbacks (Binance one-way, Gate, KuCoin, …)
+    signed = _extract_signed_position_qty(item)
+    if signed < -1e-10:
+        return "short"
+    if signed > 1e-10:
+        return "long"
+    return "long"
+
+
 def _parse_positions(raw: Any) -> list:
     """Best-effort parse positions from exchange response."""
     result = []
@@ -1611,56 +1722,13 @@ def _parse_positions(raw: Any) -> list:
                         if len(parts) == 2 and parts[0] and parts[1]:
                             display_symbol = f"{parts[0]}/{parts[1]}"
                         break
-            # For OKX, position size can be in different fields
-            # SWAP: posAmt, pos
-            # Binance futures: positionAmt
-            # SPOT: bal (balance), availBal (available balance)
-            size = float(
-                item.get("positionAmt")
-                or item.get("posAmt")
-                or item.get("pos")
-                or item.get("total")
-                or item.get("currentQty")
-                or item.get("available")
-                or item.get("size")
-                or item.get("contracts")
-                or item.get("bal")
-                or item.get("availBal")
-                or item.get("volume")
-                or item.get("current_qty")
-                or 0
-            )
+            # For OKX, pos is signed in net_mode — read before abs-only aliases.
+            size = _extract_signed_position_qty(item)
             if abs(size) < 1e-10:
                 continue
-            
-            # Binance hedge: positionSide LONG/SHORT with positive positionAmt; one-way: BOTH + signed amt
-            side = "long"
-            psu = str(item.get("positionSide", "")).strip().upper()
-            if psu == "SHORT":
-                side = "short"
-            elif psu == "LONG":
-                side = "long"
-            elif item.get("posSide"):
-                pos_side = str(item.get("posSide", "")).strip().lower()
-                if pos_side in ("long", "short"):
-                    side = pos_side
-            elif str(item.get("holdSide") or "").strip().lower() == "short":
-                side = "short"
-            elif str(item.get("holdSide") or "").strip().lower() == "long":
-                side = "long"
-            elif str(item.get("side") or "").strip().lower() in ("sell", "s"):
-                side = "short"
-            elif str(item.get("side") or "").strip().lower() in ("buy", "b"):
-                side = "long"
-            elif size < 0:
-                side = "short"
-            elif item.get("direction"):
-                dir_side = str(item.get("direction") or "").strip().lower()
-                if dir_side in ("buy", "long"):
-                    side = "long"
-                elif dir_side in ("sell", "short"):
-                    side = "short"
-            
+
+            side = _infer_position_side_from_row(item)
+
             result.append({
                 "symbol": display_symbol,
                 "side": side,

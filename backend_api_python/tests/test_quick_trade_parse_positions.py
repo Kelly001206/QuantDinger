@@ -1,0 +1,115 @@
+"""Tests for Quick Trade position side parsing (long vs short display)."""
+
+from app.routes.quick_trade import _infer_position_side_from_row, _parse_positions
+
+
+def test_binance_hedge_short():
+    row = {"positionSide": "SHORT", "positionAmt": "109", "symbol": "APTUSDT"}
+    assert _infer_position_side_from_row(row) == "short"
+
+
+def test_binance_one_way_short_signed_amt():
+    row = {"positionSide": "BOTH", "positionAmt": "-109", "symbol": "APTUSDT"}
+    assert _infer_position_side_from_row(row) == "short"
+
+
+def test_bybit_sell_side():
+    row = {"side": "Sell", "size": "109", "symbol": "APTUSDT"}
+    assert _infer_position_side_from_row(row) == "short"
+
+
+def test_bybit_position_idx_short():
+    row = {"positionIdx": 2, "size": "109", "symbol": "APTUSDT"}
+    assert _infer_position_side_from_row(row) == "short"
+
+
+def test_gate_negative_contract_size():
+    row = {"size": -50, "positionAmt": 109.0, "symbol": "APT_USDT"}
+    assert _infer_position_side_from_row(row) == "short"
+
+
+def test_gate_position_side_short():
+    row = {"size": -50, "positionAmt": 109.0, "positionSide": "SHORT", "symbol": "APT_USDT"}
+    assert _infer_position_side_from_row(row) == "short"
+
+
+def test_htx_direction_sell():
+    row = {"volume": 10, "direction": "sell", "contract_code": "APT-USDT"}
+    assert _infer_position_side_from_row(row) == "short"
+
+
+def test_parse_positions_gate_short_row():
+    raw = [{"size": -50, "positionAmt": 109.0, "positionSide": "SHORT", "contract": "APT_USDT"}]
+    out = _parse_positions(raw)
+    assert len(out) == 1
+    assert out[0]["side"] == "short"
+    assert out[0]["size"] == 109.0
+
+
+def test_okx_net_mode_short_negative_pos():
+    """OKX 买卖模式: posSide=net + pos<0 必须识别为空仓."""
+    row = {
+        "instId": "APT-USDT-SWAP",
+        "posSide": "net",
+        "pos": "-109",
+        "avgPx": "0.9129",
+        "upl": "0.1526",
+    }
+    assert _infer_position_side_from_row(row) == "short"
+
+
+def test_okx_net_mode_long_positive_pos():
+    row = {"posSide": "net", "pos": "50", "instId": "APT-USDT-SWAP"}
+    assert _infer_position_side_from_row(row) == "long"
+
+
+def test_okx_long_short_mode_short():
+    row = {"posSide": "short", "pos": "109", "instId": "APT-USDT-SWAP"}
+    assert _infer_position_side_from_row(row) == "short"
+
+
+def test_parse_positions_okx_net_mode_wrapper():
+    raw = {
+        "code": "0",
+        "data": [
+            {
+                "instId": "APT-USDT-SWAP",
+                "posSide": "net",
+                "pos": "-109",
+                "avgPx": "0.9129",
+                "upl": "0.1526",
+                "markPx": "0.9115",
+            }
+        ],
+    }
+    out = _parse_positions(raw)
+    assert len(out) == 1
+    assert out[0]["side"] == "short"
+    assert out[0]["size"] == 109.0
+
+
+def test_normalize_okx_positions_raw_net_short():
+    from app.routes.quick_trade import _normalize_okx_positions_raw
+
+    raw = {"data": [{"posSide": "net", "pos": "-109"}]}
+    norm = _normalize_okx_positions_raw(raw)
+    assert norm["data"][0]["positionSide"] == "SHORT"
+
+
+def test_parse_positions_bybit_list_wrapper():
+    raw = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "APTUSDT",
+                    "side": "Sell",
+                    "size": "109",
+                    "entryPrice": "0.9129",
+                    "unrealisedPnl": "0.15",
+                }
+            ]
+        }
+    }
+    out = _parse_positions(raw)
+    assert len(out) == 1
+    assert out[0]["side"] == "short"
