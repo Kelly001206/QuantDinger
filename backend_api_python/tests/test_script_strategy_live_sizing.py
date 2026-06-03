@@ -49,6 +49,77 @@ def test_script_buy_without_amount_omits_script_base_qty():
     assert "script_base_qty" not in sigs[0]
 
 
+def test_non_bot_script_buy_does_not_emit_add_long_when_already_long():
+    ex = _make_executor()
+    ctx = StrategyScriptContext(pd.DataFrame({"close": [0.94]}), 50.0)
+    ctx.position.open_long(0.90, 10)
+    ctx.buy(price=0.94, amount=42.5)
+
+    sigs = ex._script_orders_to_execution_signals(
+        ctx,
+        trade_direction="long",
+        bar_close=0.94,
+        closed_ts=pd.Timestamp("2026-06-02T02:01:00Z"),
+        trading_config={"market_type": "swap", "leverage": 10},
+    )
+
+    assert sigs == []
+
+
+def test_bot_script_buy_can_emit_add_long_when_already_long():
+    ex = _make_executor()
+    ctx = StrategyScriptContext(pd.DataFrame({"close": [0.94]}), 50.0)
+    ctx.position.open_long(0.90, 10)
+    ctx.buy(price=0.94, amount=5)
+
+    sigs = ex._script_orders_to_execution_signals(
+        ctx,
+        trade_direction="long",
+        bar_close=0.94,
+        closed_ts=pd.Timestamp("2026-06-02T02:01:00Z"),
+        trading_config={"market_type": "swap", "leverage": 10, "bot_type": "dca"},
+    )
+
+    assert len(sigs) == 1
+    assert sigs[0]["type"] == "add_long"
+    assert sigs[0]["script_quote_amount"] == 5
+
+
+def test_explicit_script_add_long_emits_add_long_when_already_long():
+    ex = _make_executor()
+    ctx = StrategyScriptContext(pd.DataFrame({"close": [0.94]}), 50.0)
+    ctx.position.open_long(0.90, 10)
+    ctx.add_long(amount=2.5, price=0.94)
+
+    sigs = ex._script_orders_to_execution_signals(
+        ctx,
+        trade_direction="long",
+        bar_close=0.94,
+        closed_ts=pd.Timestamp("2026-06-02T02:02:00Z"),
+        trading_config={"market_type": "swap", "leverage": 10},
+    )
+
+    assert len(sigs) == 1
+    assert sigs[0]["type"] == "add_long"
+    assert sigs[0]["script_base_qty"] == 2.5
+
+
+def test_explicit_script_add_long_requires_existing_long():
+    ex = _make_executor()
+    ctx = StrategyScriptContext(pd.DataFrame({"close": [0.94]}), 50.0)
+    ctx.add_long(amount=2.5, price=0.94)
+
+    sigs = ex._script_orders_to_execution_signals(
+        ctx,
+        trade_direction="long",
+        bar_close=0.94,
+        closed_ts=pd.Timestamp("2026-06-02T02:02:00Z"),
+        trading_config={"market_type": "swap", "leverage": 10},
+    )
+
+    assert sigs == []
+
+
 def test_bot_script_buy_emits_quote_amount():
     ex = _make_executor()
     ctx = StrategyScriptContext(pd.DataFrame({"close": [668.2]}), 100.0)

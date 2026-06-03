@@ -402,6 +402,15 @@ class StrategyScriptContext:
             'reason': reason,
         })
 
+    def add_long(self, amount: Any = None, price: Any = None, reason: Optional[str] = None):
+        self._orders.append({
+            'action': 'buy',
+            'price': price,
+            'amount': amount,
+            'intent': 'add_long',
+            'reason': reason or 'script_add_long',
+        })
+
     def open_short(self, amount: Any = None, price: Any = None, reason: Optional[str] = None):
         self._orders.append({
             'action': 'sell',
@@ -409,6 +418,15 @@ class StrategyScriptContext:
             'amount': amount,
             'intent': 'open_short',
             'reason': reason,
+        })
+
+    def add_short(self, amount: Any = None, price: Any = None, reason: Optional[str] = None):
+        self._orders.append({
+            'action': 'sell',
+            'price': price,
+            'amount': amount,
+            'intent': 'add_short',
+            'reason': reason or 'script_add_short',
         })
 
     def close_position(self):

@@ -140,6 +140,193 @@ def test_grid_line_qty_uses_quote_amount_times_leverage():
     assert engine._grid_base_qty(72710.0) == pytest.approx(4.0 * 20.0 / 72710.0, rel=1e-4)
 
 
+def test_boundary_stop_loss_auto_stops_neutral_grid(monkeypatch):
+    from app.services.grid.engine import GridEngine
+
+    tc = {
+        "initial_capital": 100,
+        "leverage": 5,
+        "market_type": "swap",
+        "bot_params": {
+            "upperPrice": 81200,
+            "lowerPrice": 70200,
+            "gridCount": 28,
+            "amountPerGrid": 3,
+            "gridDirection": "neutral",
+            "boundaryAction": "stop_loss",
+        },
+    }
+    enqueued = []
+    stopped = []
+    logs = []
+
+    monkeypatch.setattr("app.services.grid.engine.append_strategy_log", lambda *args: logs.append(args))
+    monkeypatch.setattr("app.services.grid.engine.GridEngine.cancel_entry_orders_on_exchange", lambda self: None)
+    monkeypatch.setattr(
+        "app.services.strategy_lifecycle.auto_stop_live_strategy",
+        lambda sid, reason, source="": stopped.append((sid, reason, source)) or True,
+    )
+
+    engine = GridEngine(
+        77,
+        "BTC/USDT",
+        tc,
+        {},
+        create_client_fn=lambda: object(),
+        enqueue_market=lambda *args: enqueued.append(args) or True,
+    )
+
+    assert engine.handle_boundary(69000.0) is True
+    assert engine.stop_requested is True
+    assert "out of bounds" in engine.stop_reason
+    assert enqueued == [
+        ("close_long", 0, 69000.0, "grid_boundary_stop"),
+        ("close_short", 0, 69000.0, "grid_boundary_stop"),
+    ]
+    assert stopped and stopped[0][0] == 77
+    assert stopped[0][2] == "grid_boundary"
+    assert any("69000.0000" in str(row[-1]) and "70200.0000" in str(row[-1]) for row in logs)
+
+
+def test_boundary_pause_does_not_auto_stop(monkeypatch):
+    from app.services.grid.engine import GridEngine
+
+    tc = {
+        "initial_capital": 100,
+        "leverage": 5,
+        "market_type": "swap",
+        "bot_params": {
+            "upperPrice": 81200,
+            "lowerPrice": 70200,
+            "gridCount": 28,
+            "amountPerGrid": 3,
+            "gridDirection": "neutral",
+            "boundaryAction": "pause",
+        },
+    }
+    enqueued = []
+    stopped = []
+
+    monkeypatch.setattr("app.services.grid.engine.append_strategy_log", lambda *a: None)
+    monkeypatch.setattr("app.services.grid.engine.GridEngine.cancel_entry_orders_on_exchange", lambda self: None)
+    monkeypatch.setattr(
+        "app.services.strategy_lifecycle.auto_stop_live_strategy",
+        lambda *args, **kwargs: stopped.append((args, kwargs)) or True,
+    )
+
+    engine = GridEngine(
+        78,
+        "BTC/USDT",
+        tc,
+        {},
+        create_client_fn=lambda: object(),
+        enqueue_market=lambda *args: enqueued.append(args) or True,
+    )
+
+    assert engine.handle_boundary(69000.0) is True
+    assert engine.stop_requested is False
+    assert engine._paused_entries is True
+    assert enqueued == []
+    assert stopped == []
+
+
+def test_neutral_grid_rehangs_held_cell_exits(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.services.grid.engine import GridEngine
+    from app.services.grid.levels import generate_cells, generate_levels
+    from app.services.live_trading.grid_cells import GridCellState
+
+    tc = {
+        "initial_capital": 100,
+        "leverage": 5,
+        "market_type": "swap",
+        "bot_params": {
+            "upperPrice": 96,
+            "lowerPrice": 72,
+            "gridCount": 5,
+            "amountPerGrid": 5,
+            "gridDirection": "neutral",
+        },
+    }
+    levels = generate_levels(72, 96, 5, "arithmetic")
+    cells = generate_cells(levels)
+    placed = []
+
+    engine = GridEngine(
+        79,
+        "SOL/USDT",
+        tc,
+        {},
+        create_client_fn=lambda: object(),
+        enqueue_market=lambda *args: True,
+    )
+    engine._bootstrapped = True
+
+    monkeypatch.setattr("app.services.grid.engine.append_strategy_log", lambda *a: None)
+    monkeypatch.setattr("app.services.grid.engine.GridEngine._levels_and_cells", lambda self: (levels, cells))
+    monkeypatch.setattr("app.services.grid.engine.GridEngine._normalize_grid_base_qty", lambda self, qty, px: qty)
+    monkeypatch.setattr(
+        engine._cells,
+        "list_cells",
+        lambda sid, symbol: [
+            SimpleNamespace(cell_index=1, state=GridCellState.LONG_HELD, leg_size=1.2),
+            SimpleNamespace(cell_index=2, state=GridCellState.SHORT_HELD, leg_size=0.8),
+        ],
+    )
+    monkeypatch.setattr(engine._orders, "has_open_for_cell", lambda *args: False)
+
+    def fake_place(self, cell, purpose, side, price, *, reduce_only, pos_side, quantity=None):
+        placed.append((cell.index, purpose, side, price, reduce_only, pos_side, quantity))
+        return True
+
+    monkeypatch.setattr("app.services.grid.engine.GridEngine._place_limit", fake_place)
+
+    assert engine.sync_held_cell_exits(80.0) == 2
+    assert placed == [
+        (1, "long_exit", "sell", cells[1].upper_price, True, "long", 1.2),
+        (2, "short_exit", "buy", cells[2].lower_price, True, "short", 0.8),
+    ]
+
+
+def test_grid_shutdown_releases_cancelled_cell_states(monkeypatch):
+    from app.services.grid.engine import GridEngine
+
+    tc = {
+        "initial_capital": 100,
+        "leverage": 5,
+        "market_type": "swap",
+        "bot_params": {
+            "upperPrice": 96,
+            "lowerPrice": 72,
+            "gridCount": 5,
+            "amountPerGrid": 5,
+            "gridDirection": "neutral",
+        },
+    }
+    calls = []
+    engine = GridEngine(
+        80,
+        "SOL/USDT",
+        tc,
+        {},
+        create_client_fn=lambda: object(),
+        enqueue_market=lambda *args: True,
+    )
+    monkeypatch.setattr("app.services.grid.engine.append_strategy_log", lambda *a: None)
+    monkeypatch.setattr(engine, "cancel_all_orders_on_exchange", lambda: calls.append("exchange_cancel"))
+    monkeypatch.setattr(engine._orders, "cancel_all", lambda sid, symbol: calls.append(("orders_cancel", sid, symbol)) or 3)
+    monkeypatch.setattr(engine._cells, "release_cancelled_working_orders", lambda sid, symbol: calls.append(("cells_release", sid, symbol)) or 4)
+
+    engine.shutdown()
+
+    assert calls == [
+        "exchange_cancel",
+        ("orders_cancel", 80, "SOL/USDT"),
+        ("cells_release", 80, "SOL/USDT"),
+    ]
+
+
 def test_initial_market_recovers_from_exchange_without_new_order(monkeypatch):
     from app.services.grid.engine import GridEngine
 

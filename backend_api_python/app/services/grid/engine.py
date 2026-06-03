@@ -57,6 +57,7 @@ class GridEngine:
             self._initial_done = True
         self._consecutive_order_errors = 0
         self._stop_requested = False
+        self._stop_reason = ""
         self._last_initial_attempt_ts = 0.0
         self._initial_retry_sec = 30.0
         self._initial_market_attempts = 0
@@ -65,6 +66,10 @@ class GridEngine:
     @property
     def stop_requested(self) -> bool:
         return bool(self._stop_requested)
+
+    @property
+    def stop_reason(self) -> str:
+        return str(self._stop_reason or "")
 
     def _record_order_error(self, purpose: str, exc: Exception) -> None:
         if self._stop_requested:
@@ -97,6 +102,7 @@ class GridEngine:
             ):
                 self._stop_requested = True
                 self._paused_entries = True
+                self._stop_reason = "exchange error while placing grid resting order"
         except Exception as e:
             logger.debug("grid auto-stop check sid=%s: %s", self.strategy_id, e)
 
@@ -718,7 +724,7 @@ class GridEngine:
         if not self._bootstrapped or current_price <= 0:
             return 0
         direction = self.cfg.grid_direction
-        if direction not in ("long", "short"):
+        if direction not in ("long", "short", "neutral"):
             return 0
         placed = 0
         rows = self._cells.list_cells(self.strategy_id, self.symbol)
@@ -730,7 +736,7 @@ class GridEngine:
             spec = cell_map.get(cell_idx)
             if not spec:
                 continue
-            if direction == "long" and st == GridCellState.LONG_HELD:
+            if direction in ("long", "neutral") and st == GridCellState.LONG_HELD:
                 if self._orders.has_open_for_cell(self.strategy_id, cell_idx, "long_exit"):
                     continue
                 leg = float(cell.leg_size or 0.0)
@@ -747,7 +753,7 @@ class GridEngine:
                     quantity=qty,
                 ):
                     placed += 1
-            elif direction == "short" and st == GridCellState.SHORT_HELD:
+            elif direction in ("short", "neutral") and st == GridCellState.SHORT_HELD:
                 if self._orders.has_open_for_cell(self.strategy_id, cell_idx, "short_exit"):
                     continue
                 leg = float(cell.leg_size or 0.0)
@@ -1070,10 +1076,10 @@ class GridEngine:
                         cell, "short_entry", "sell", cell.upper_price, reduce_only=False, pos_side="short", quantity=fq
                     )
 
-    def handle_boundary(self, current_price: float) -> None:
+    def handle_boundary(self, current_price: float) -> bool:
         upper, lower = self.cfg.effective_bounds(self._runtime_params)
         if upper <= lower or current_price <= 0:
-            return
+            return False
         action = self.cfg.boundary_action
         out_of_low = current_price < lower
         out_of_high = current_price > upper
@@ -1086,16 +1092,30 @@ class GridEngine:
         else:
             triggered = False
         if not triggered:
-            return
+            return False
+        side = "below lower" if out_of_low else "above upper"
+        detail = (
+            f"price={current_price:.4f} is {side} bound "
+            f"[{lower:.4f}, {upper:.4f}], direction={self.cfg.grid_direction}"
+        )
         if action == "hold":
-            append_strategy_log(self.strategy_id, "warning", "Grid out of bounds (hold)")
-            return
+            append_strategy_log(self.strategy_id, "warning", f"Grid out of bounds (hold): {detail}")
+            return True
         self.cancel_entry_orders_on_exchange()
         self._paused_entries = True
-        append_strategy_log(self.strategy_id, "warning", f"Grid out of bounds -> {action}")
+        append_strategy_log(self.strategy_id, "warning", f"Grid out of bounds -> {action}: {detail}")
         if action == "stop_loss":
             self._enqueue_market("close_long", 0, current_price, "grid_boundary_stop")
             self._enqueue_market("close_short", 0, current_price, "grid_boundary_stop")
+            self._stop_requested = True
+            self._stop_reason = f"grid out of bounds ({detail}); stop_loss requested"
+            try:
+                from app.services.strategy_lifecycle import auto_stop_live_strategy
+
+                auto_stop_live_strategy(self.strategy_id, self._stop_reason, source="grid_boundary")
+            except Exception as e:
+                logger.debug("grid boundary auto-stop sid=%s: %s", self.strategy_id, e)
+        return True
 
     def cancel_entry_orders_on_exchange(self) -> None:
         open_orders = self._orders.list_open(self.strategy_id)
@@ -1166,3 +1186,6 @@ class GridEngine:
     def shutdown(self) -> None:
         self.cancel_all_orders_on_exchange()
         self._orders.cancel_all(self.strategy_id, self.symbol)
+        released = self._cells.release_cancelled_working_orders(self.strategy_id, self.symbol)
+        if released:
+            append_strategy_log(self.strategy_id, "info", f"Grid released {released} local cell working state(s)")

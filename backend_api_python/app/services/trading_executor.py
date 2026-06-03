@@ -1382,22 +1382,22 @@ class TradingExecutor:
                     'timestamp': ts_i, 'matched_entry_price': avg_entry,
                 }, reason_hint or ('grid_reduce_short' if is_grid_bot else None))
                 continue
-
-            if intent == 'open_long':
-                if td not in ('long', 'both'):
+            if intent in ('open_long', 'add_long'):
+                has_long = ctx.position.has_long()
+                if td not in ('long', 'both') or (intent == 'add_long' and not has_long) or (intent == 'open_long' and has_long and not is_bot_script):
                     continue
-                sig_type = 'add_long' if ctx.position.has_long() else 'open_long'
+                sig_type = 'add_long' if has_long else 'open_long'
                 ctx.position.open_long(ref_px, local_qty)
                 _emit({
                     'type': sig_type, 'trigger_price': ref_px, 'position_size': pos_ratio,
                     'timestamp': ts_i,
                 }, reason_hint)
                 continue
-
-            if intent == 'open_short':
-                if td not in ('short', 'both'):
+            if intent in ('open_short', 'add_short'):
+                has_short = ctx.position.has_short()
+                if td not in ('short', 'both') or (intent == 'add_short' and not has_short) or (intent == 'open_short' and has_short and not is_bot_script):
                     continue
-                sig_type = 'add_short' if ctx.position.has_short() else 'open_short'
+                sig_type = 'add_short' if has_short else 'open_short'
                 ctx.position.open_short(ref_px, local_qty)
                 _emit({
                     'type': sig_type, 'trigger_price': ref_px, 'position_size': pos_ratio,
@@ -1405,11 +1405,7 @@ class TradingExecutor:
                 }, reason_hint)
                 continue
 
-            # ---- Legacy ctx.buy / ctx.sell (intent == 'auto') ----------------
-            # For grid bots: a buy first covers the short leg if any, then
-            # opens/adds the long leg. The order's `amount` is interpreted as
             # ONE atomic step — if the short leg can absorb it we don't also
-            # add a long, mirroring the old behaviour but using hedge state.
             if action == 'buy':
                 if is_grid_bot:
                     if ctx.position.has_short():
@@ -1435,12 +1431,12 @@ class TradingExecutor:
                             'matched_entry_price': avg_entry,
                         }, reason_hint)
                     if td in ('long', 'both'):
-                        sig_type = 'add_long' if ctx.position.has_long() else 'open_long'
-                        ctx.position.open_long(ref_px, local_qty)
-                        _emit({
-                            'type': sig_type, 'trigger_price': ref_px,
-                            'position_size': pos_ratio, 'timestamp': ts_i,
-                        }, reason_hint)
+                        if not ctx.position.has_long():
+                            ctx.position.open_long(ref_px, local_qty)
+                            _emit({
+                                'type': 'open_long', 'trigger_price': ref_px,
+                                'position_size': pos_ratio, 'timestamp': ts_i,
+                            }, reason_hint)
                 continue
 
             if action == 'sell':
@@ -1468,12 +1464,12 @@ class TradingExecutor:
                             'matched_entry_price': avg_entry,
                         }, reason_hint)
                     if td in ('short', 'both'):
-                        sig_type = 'add_short' if ctx.position.has_short() else 'open_short'
-                        ctx.position.open_short(ref_px, local_qty)
-                        _emit({
-                            'type': sig_type, 'trigger_price': ref_px,
-                            'position_size': pos_ratio, 'timestamp': ts_i,
-                        }, reason_hint)
+                        if not ctx.position.has_short():
+                            ctx.position.open_short(ref_px, local_qty)
+                            _emit({
+                                'type': 'open_short', 'trigger_price': ref_px,
+                                'position_size': pos_ratio, 'timestamp': ts_i,
+                            }, reason_hint)
         return out
 
     def _script_evaluate_new_closed_bar(
@@ -2116,7 +2112,7 @@ class TradingExecutor:
                         _abort_loop(f"grid resting startup failed: {err_gr}")
                         return
                     if grid_resting_runner.should_stop:
-                        _abort_loop("Grid auto-stopped during startup: exchange error")
+                        _abort_loop(f"Grid auto-stopped during startup: {grid_resting_runner.stop_reason or 'grid resting engine requested stop'}")
                         return
                     pending_signals = []
                     append_strategy_log(
@@ -2264,7 +2260,7 @@ class TradingExecutor:
                                                 )
                                             pending_signals = []
                                             if grid_resting_runner.should_stop:
-                                                exit_reason = "Grid auto-stopped: exchange error"
+                                                exit_reason = f"Grid auto-stopped: {grid_resting_runner.stop_reason or 'engine requested stop'}"
                                                 logger.error(f"Strategy {strategy_id} {exit_reason}")
                                                 _set_db_stopped_best_effort(exit_reason)
                                                 break
@@ -2375,7 +2371,7 @@ class TradingExecutor:
                             except Exception as e:
                                 logger.warning(f"Strategy {strategy_id} grid resting tick error: {e}")
                             if grid_resting_runner.should_stop:
-                                exit_reason = "Grid auto-stopped: exchange error"
+                                exit_reason = f"Grid auto-stopped: {grid_resting_runner.stop_reason or 'engine requested stop'}"
                                 logger.error(f"Strategy {strategy_id} {exit_reason}")
                                 _set_db_stopped_best_effort(exit_reason)
                                 break
